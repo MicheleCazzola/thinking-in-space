@@ -109,6 +109,195 @@ bash evaluate_all_in_one.sh --model all --num_processes 8 --benchmark vsibench
 
 > Note: The evaluation results for open-source models may differ slightly from our tables due to additional data refinement. We will update the tables and our paper soon.
 
+For local evaluation, use `evaluate_vsi.sh` and select exactly one benchmark:
+`vsi-bench`, `vsi-bench-tiny`, or `vsi-bench-debiased`. The `vsi-bench-tiny`
+task uses the official 400 question IDs published by the authors. Eight of
+those IDs were removed in the later dataset release, so the current Hugging
+Face data yields 392 available questions; do not use `--limit 400`.
+The script supports one selected local model
+without an API key or one Gemini model using the ignored `.google_api_key` file in
+the repository root. Put the Google API key on a single line in that file:
+
+```bash
+printf '%s\n' 'YOUR_GOOGLE_API_KEY' > .google_api_key
+
+conda activate vsibench
+python -m pip install -e ".[gemini]"
+
+bash evaluate_vsi.sh --model llava_one_vision_qwen2_0p5b_ov --benchmark vsi-bench \
+  --num_frames 2 --limit 20 --data_dir data/VSI-Bench
+
+bash evaluate_vsi.sh --model gemini_1p5_flash --benchmark vsi-bench-debiased \
+  --limit 20
+
+bash evaluate_vsi.sh --model gemini-3.6-flash --benchmark vsi-bench-tiny \
+  --no-thinking --no-context-caching --num_processes 1 \
+  --launcher python --output_path logs/reproduction/vsibench-tiny
+```
+
+The last command follows the ReVSI evaluation protocol (arXiv 2604.24300,
+Appendix) for proprietary models on VSI-Bench: lmms-eval with greedy decoding
+(`temperature=0`, `top_p=1`, `top_k=1`), the official VSI-Bench tiny set, the
+VSI-Bench prompt template for proprietary models (`These are frames of a
+video.` + question + the numerical / multiple-choice post-prompt), and the
+whole video uploaded to Gemini so that Gemini's default FPS-based sampling
+(1 FPS) is used. For this protocol do not pass `--resolution_mode`: the paper
+uses Gemini's default media resolution.
+
+#### Running Gemini through Vertex AI (e.g. from a Google Cloud VM)
+
+`--backend vertex` calls Gemini through Vertex AI with Application Default
+Credentials (on a Compute Engine VM: its service account), so no API key is
+needed and usage is billed to the Google Cloud project. Vertex has no Files API,
+so each video is uploaded once to a GCS bucket (`gs://BUCKET/vsibench/<dataset>/<scene>.mp4`,
+skipped if already there) and passed to Gemini by URI; Gemini still receives the
+whole video and samples it at its default 1 FPS.
+
+```bash
+# one-time setup (VM access scope: cloud-platform; service account roles:
+# Vertex AI User + Storage Object Admin on the bucket)
+gcloud services enable aiplatform.googleapis.com storage.googleapis.com
+gcloud storage buckets create gs://YOUR_BUCKET --location=us-central1
+python -m pip install -e ".[gemini]"
+
+bash evaluate_vsi.sh --model gemini-3.8-flash --benchmark vsi-bench-tiny \
+  --backend vertex --gcp_project YOUR_PROJECT --gcs_bucket YOUR_BUCKET \
+  --no-thinking --no-context-caching --launcher python \
+  --resume_dir logs/revsi-protocol/gemini-3.8-flash-responses \
+  --output_path logs/revsi-protocol/gemini-3.8-flash
+```
+
+`--gcp_location` defaults to `global`. Uploads (Files API or GCS) and generation
+requests are retried with exponential backoff (15 s doubling, capped at 300 s,
+8 attempts; `GEMINI_MAX_ATTEMPTS`, `GEMINI_RETRY_BASE_SECONDS`,
+`GEMINI_RETRY_MAX_SECONDS`) on 429/5xx, timeouts and dropped connections; each
+HTTP request times out after `GEMINI_REQUEST_TIMEOUT` seconds (default 300).
+Questions that still get no answer are listed in an error at the end of the
+run, because they are scored as wrong. With `--resume_dir`, answers are saved
+as they arrive and re-running the same command only redoes the missing ones.
+
+Gemini thinking is disabled by default (`--no-thinking`): requests are sent with
+`thinking_budget=0`. If a model rejects a zero budget, the backend logs a
+warning and falls back to `thinking_level="minimal"`, the lowest level that
+model accepts. If the model still reports thinking tokens, a warning is logged
+once. Use `--thinking` to restore the model's default thinking behaviour.
+
+Gemini context caching is disabled by default. Enable it explicitly when the
+selected model and account support it:
+
+```bash
+bash evaluate_vsi.sh --model gemini-3-flash-preview \
+  --benchmark vsi-bench --context-caching --limit 20
+```
+
+Gemini video resolution can be selected with `--resolution_mode`:
+
+```bash
+bash evaluate_vsi.sh --model gemini-3.6-flash \
+  --benchmark vsi-bench --limit 20 --resolution_mode high
+```
+
+Supported values are `low`, `medium`, `high`, and `ultra_high`. The option is
+passed to the Gemini API as `media_resolution`; it applies only to Gemini
+models.
+
+Use `--no-context-caching` to disable it explicitly. Without either flag, the
+script uses only the upload cache and does not call the Gemini context-caching
+API.
+
+Gemini models can also be selected by passing their Google model ID directly.
+The wrapper accepts IDs from every Gemini generation, including preview IDs:
+
+```bash
+bash evaluate_vsi.sh --model gemini-2.5-flash --benchmark vsi-bench --limit 20
+bash evaluate_vsi.sh --model gemini-2.5-pro --benchmark vsi-bench-debiased --limit 20
+bash evaluate_vsi.sh --model gemini-3-flash-preview --benchmark vsi-bench --limit 20
+bash evaluate_vsi.sh --model models/gemini-2.5-flash --benchmark vsi-bench --limit 20
+```
+
+The model ID is passed unchanged as `model_version` to the Gemini backend.
+The model must exist and support video input for the Google API key and SDK
+installed in the environment.
+
+### Gemini models available for the current API key
+
+The following is the complete snapshot returned by `client.models.list()` for
+the API key in `.google_api_key`, queried on 2026-11-03. Names below omit the
+optional `models/` prefix. Availability and capabilities can change over time.
+All models in the first list expose `generateContent`; that does not by itself
+guarantee that a model accepts VSI-Bench video input.
+
+```text
+gemini-2.5-flash
+gemini-2.5-pro
+gemini-2.5-flash-preview-tts
+gemini-2.5-pro-preview-tts
+gemini-flash-latest
+gemini-flash-lite-latest
+gemini-pro-latest
+gemini-2.5-flash-lite
+gemini-2.5-flash-image
+gemini-3-flash-preview
+gemini-3.1-pro-preview
+gemini-3.1-pro-preview-customtools
+gemini-3.1-flash-lite-preview
+gemini-3.1-flash-lite
+gemini-3-pro-image-preview
+gemini-3-pro-image
+gemini-3.1-flash-image-preview
+gemini-3.1-flash-image
+gemini-3.1-flash-lite-image
+gemini-3.5-flash
+gemini-3.5-flash-lite
+gemini-omni-flash-preview
+gemini-omni-1.1-flash
+gemini-3.5-transcribe
+gemini-3.6-flash
+gemini-3.7-flash
+gemini-3.8-flash
+gemini-4-argon
+gemini-2.5-computer-use-preview-10-2025
+gemini-robotics-er-2-preview
+```
+
+The same API key also exposes these Gemini-family models with non-standard
+endpoints or non-generation methods:
+
+```text
+gemini-embedding-001
+gemini-embedding-2-preview
+gemini-embedding-2
+gemini-3.5-transcribe-live
+gemini-2.5-flash-native-audio-latest
+gemini-2.5-flash-native-audio-preview-09-2025
+gemini-2.5-flash-native-audio-preview-12-2025
+gemini-3.1-flash-live-preview
+gemini-3.8-live
+gemini-3.8-live-extended-thinking
+gemini-3.5-live-translate-preview
+gemini-robotics-er-2-streaming-preview
+```
+
+To refresh this list without exposing the key, run:
+
+```powershell
+$env:GOOGLE_API_KEY = (Get-Content -Raw .google_api_key).Trim()
+conda run --no-capture-output -n vsibench python -c "from google import genai; import os; c=genai.Client(api_key=os.environ['GOOGLE_API_KEY']); [print(m.name, getattr(m, 'supported_actions', None)) for m in c.models.list()]"
+```
+
+The Gemini backend uses `max_output_tokens=8192`, as in the original lmms-eval
+Gemini setup (a tight cap truncated responses and produced empty answers;
+empty responses are now logged with their `finish_reason`). Uploaded videos are cached locally in memory for the run,
+and transient API failures are retried up to four times with exponential
+backoff. It also creates a one-hour Gemini
+context cache per video when supported by the installed SDK and selected model.
+If context caching is unavailable, the run continues with the upload cache and
+logs an explicit warning.
+
+On Windows/Conda, if `SSL_CERT_FILE` points to a missing certificate bundle,
+the Gemini backend automatically uses the installed `certifi` bundle while
+keeping TLS certificate verification enabled.
+
 ## Limitations
 
 We strive to maintain the highest quality in our benchmark, but some imperfections may persist. If you notice any, we encourage you to reach out and share your valuable feedback!
@@ -128,4 +317,3 @@ If you find our paper and code useful in your research, please consider giving u
     journal={arXiv preprint arXiv:2412.14171},
 }
 ```
-

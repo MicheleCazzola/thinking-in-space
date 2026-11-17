@@ -36,6 +36,7 @@ METRICS_FOR_NA = {
 
 hf_home = os.getenv("HF_HOME", "~/.cache/huggingface/")
 base_cache_dir = os.path.expanduser(hf_home)
+local_data_dir = os.getenv("VSI_BENCH_DATA_DIR")
 with open(Path(__file__).parent / "vsibench.yaml", "r") as f:
     raw_data = f.readlines()
     safe_data = []
@@ -46,7 +47,7 @@ cache_name = yaml.safe_load("".join(safe_data))["dataset_kwargs"]["cache_dir"]
 
 
 def vsibench_doc_to_visual(doc):
-    cache_dir = os.path.join(base_cache_dir, cache_name)
+    cache_dir = os.path.expanduser(local_data_dir) if local_data_dir else os.path.join(base_cache_dir, cache_name)
     video_path = doc["dataset"] + "/" + doc["scene_name"] + ".mp4"
     video_path = os.path.join(cache_dir, video_path)
     if os.path.exists(video_path):
@@ -76,6 +77,17 @@ def process_docs(dataset: datasets.Dataset) -> datasets.Dataset:
     if os.getenv('LMMS_EVAL_SHUFFLE_DOCS', None):
         eval_logger.info(f"Environment variable LMMS_EVAL_SHUFFLE_DOCS detected, dataset will be shuffled.")
         return dataset.shuffle(seed=42)
+    return dataset
+
+def process_docs_tiny(dataset: datasets.Dataset) -> datasets.Dataset:
+    tiny_ids_path = Path(__file__).with_name("vsibench_tiny_ids.txt")
+    with tiny_ids_path.open() as file:
+        tiny_ids = {int(line.strip()) for line in file if line.strip()}
+    dataset = dataset.filter(lambda doc: doc["id"] in tiny_ids)
+    if os.getenv('LMMS_EVAL_SHUFFLE_DOCS', None):
+        eval_logger.info(f"Environment variable LMMS_EVAL_SHUFFLE_DOCS detected, dataset will be shuffled.")
+        dataset = dataset.shuffle(seed=42)
+    eval_logger.info(f"VSI-Bench tiny subset contains {len(dataset)} available questions.")
     return dataset
 
 def fuzzy_matching(pred):
