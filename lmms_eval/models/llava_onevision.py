@@ -72,11 +72,11 @@ class Llava_OneVision(lmms):
         self,
         pretrained: str = "liuhaotian/llava-v1.5-7b",
         truncation: Optional[bool] = True,
-        device: Optional[str] = "cuda:0",
+        device: Optional[str] = None,
         batch_size: Optional[Union[int, str]] = 1,
         model_name: Optional[str] = None,
         attn_implementation: Optional[str] = best_fit_attn_implementation,
-        device_map: Optional[str] = "cuda:0",
+        device_map: Optional[str] = None,
         conv_template: Optional[str] = "vicuna_v1",
         use_cache: Optional[bool] = True,
         truncate_context: Optional[bool] = False,  # whether to truncate the context in generation, set it False for LLaVA-1.6
@@ -94,15 +94,24 @@ class Llava_OneVision(lmms):
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+        requested_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested for llava_onevision, but CUDA is not available.")
+
+        if accelerator.num_processes > 1 and requested_device == "cpu":
+            raise ValueError("llava_onevision does not support multi-process CPU inference; use --num_processes 1.")
+
         if accelerator.num_processes > 1:
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
-        elif accelerator.num_processes == 1 and device_map == "auto":
-            self._device = torch.device(device)
-            self.device_map = device_map
+        elif accelerator.num_processes == 1 and device_map in (None, "auto"):
+            self._device = torch.device(requested_device)
+            self.device_map = "auto" if requested_device == "cpu" else (device_map or requested_device)
         else:
-            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
-            self.device_map = f"cuda:{accelerator.local_process_index}"
+            self._device = torch.device(requested_device)
+            self.device_map = device_map
+
+        self._input_dtype = torch.float16 if self._device.type == "cuda" else torch.float32
 
         llava_model_args = {
             "multimodal": True,
@@ -180,7 +189,7 @@ class Llava_OneVision(lmms):
             self._rank = self.accelerator.local_process_index
             self._world_size = self.accelerator.num_processes
 
-        elif accelerator.num_processes == 1 and device_map == "auto":
+        elif accelerator.num_processes == 1 and self.device_map == "auto":
             eval_logger.info(f"Using {accelerator.num_processes} devices with tensor parallelism")
             self._rank = 0
             self._world_size = 1
@@ -280,18 +289,18 @@ class Llava_OneVision(lmms):
 
                     image_tensor = process_images(visual, self._image_processor, self._config)
                     if type(image_tensor) is list:
-                        image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                        image_tensor = [_image.to(dtype=self._input_dtype, device=self.device) for _image in image_tensor]
                     else:
-                        image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                        image_tensor = image_tensor.to(dtype=self._input_dtype, device=self.device)
 
                     task_type = "video"
 
                 elif type(visual[0]) == PIL.Image.Image:
                     image_tensor = process_images(visual, self._image_processor, self._config)
                     if type(image_tensor) is list:
-                        image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                        image_tensor = [_image.to(dtype=self._input_dtype, device=self.device) for _image in image_tensor]
                     else:
-                        image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                        image_tensor = image_tensor.to(dtype=self._input_dtype, device=self.device)
 
                     task_type = "image"
 
@@ -302,7 +311,9 @@ class Llava_OneVision(lmms):
                             frames = self.load_video(visual, self.max_frames_num)
                         elif self.video_decode_backend == "pyav":
                             frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
-                        frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].half().cuda()
+                        frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(
+                            dtype=self._input_dtype, device=self.device
+                        )
                         image_tensor.append(frames)
                     except Exception as e:
                         eval_logger.error(f"Error {e} in loading video")
@@ -440,9 +451,9 @@ class Llava_OneVision(lmms):
 
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
-                            image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                            image_tensor = [_image.to(dtype=self._input_dtype, device=self.device) for _image in image_tensor]
                         else:
-                            image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                            image_tensor = image_tensor.to(dtype=self._input_dtype, device=self.device)
 
                         task_type = "video"
                         placeholder_count = 1
@@ -450,9 +461,9 @@ class Llava_OneVision(lmms):
                     elif type(visual[0]) == PIL.Image.Image:  # For image, multi-image tasks
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
-                            image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                            image_tensor = [_image.to(dtype=self._input_dtype, device=self.device) for _image in image_tensor]
                         else:
-                            image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                            image_tensor = image_tensor.to(dtype=self._input_dtype, device=self.device)
 
                         task_type = "image"
                         placeholder_count = len(visual) if isinstance(visual, list) else 1
@@ -464,7 +475,9 @@ class Llava_OneVision(lmms):
                                 frames = self.load_video(visual, self.max_frames_num)
                             elif self.video_decode_backend == "pyav":
                                 frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
-                            frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].half().cuda()
+                            frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(
+                                dtype=self._input_dtype, device=self.device
+                            )
                             image_tensor.append(frames)
                         except Exception as e:
                             eval_logger.error(f"Error {e} in loading video")
