@@ -149,19 +149,25 @@ uses Gemini's default media resolution.
 `--backend vertex` calls Gemini through Vertex AI with Application Default
 Credentials (on a Compute Engine VM: its service account), so no API key is
 needed and usage is billed to the Google Cloud project. Vertex has no Files API,
-so each video is uploaded once to a GCS bucket (`gs://BUCKET/vsibench/<dataset>/<scene>.mp4`,
-skipped if already there) and passed to Gemini by URI; Gemini still receives the
-whole video and samples it at its default 1 FPS.
+so videos are passed to Gemini by GCS URI: `gs://BUCKET/PREFIX/<dataset>/<scene>.mp4`.
+`--gcs_prefix` (default `vsibench`) is the folder in the bucket that holds the
+videos. A video that already exists there is used as is and never overwritten;
+only a missing one is uploaded from `--data_dir`. If the dataset is already in
+the bucket (for example `gs://BUCKET/data/VSI-Bench/scannet/...`), pass
+`--gcs_prefix data/VSI-Bench` and nothing is uploaded. The local videos in
+`--data_dir` must still exist, because the task checks them. Gemini still
+receives the whole video and samples it at its default 1 FPS.
 
 ```bash
 # one-time setup (VM access scope: cloud-platform; service account roles:
-# Vertex AI User + Storage Object Admin on the bucket)
+# Vertex AI User + Storage Object Viewer on the bucket, or Storage Object Admin
+# if videos must be uploaded)
 gcloud services enable aiplatform.googleapis.com storage.googleapis.com
-gcloud storage buckets create gs://YOUR_BUCKET --location=us-central1
 python -m pip install -e ".[gemini]"
 
 bash evaluate_vsi.sh --model gemini-3.8-flash --benchmark vsi-bench-tiny \
   --backend vertex --gcp_project YOUR_PROJECT --gcs_bucket YOUR_BUCKET \
+  --gcs_prefix data/VSI-Bench --data_dir data/VSI-Bench \
   --no-thinking --no-context-caching --launcher python \
   --resume_dir logs/revsi-protocol/gemini-3.8-flash-responses \
   --output_path logs/revsi-protocol/gemini-3.8-flash
@@ -171,16 +177,69 @@ bash evaluate_vsi.sh --model gemini-3.8-flash --benchmark vsi-bench-tiny \
 requests are retried with exponential backoff (15 s doubling, capped at 300 s,
 8 attempts; `GEMINI_MAX_ATTEMPTS`, `GEMINI_RETRY_BASE_SECONDS`,
 `GEMINI_RETRY_MAX_SECONDS`) on 429/5xx, timeouts and dropped connections; each
-HTTP request times out after `GEMINI_REQUEST_TIMEOUT` seconds (default 300).
+HTTP request times out after `GEMINI_REQUEST_TIMEOUT` seconds (default 300) of
+inactivity, and every single API call (generation, upload, polling) is also
+abandoned and retried after a total wall-clock deadline of `GEMINI_CALL_DEADLINE`
+seconds (default: same as `GEMINI_REQUEST_TIMEOUT`; `0` disables it).
 Questions that still get no answer are listed in an error at the end of the
 run, because they are scored as wrong. With `--resume_dir`, answers are saved
 as they arrive and re-running the same command only redoes the missing ones.
+The per-question metadata (see below) is saved next to them in
+`<model>_metadata.json`, so resumed answers keep it.
 
 Gemini thinking is disabled by default (`--no-thinking`): requests are sent with
 `thinking_budget=0`. If a model rejects a zero budget, the backend logs a
-warning and falls back to `thinking_level="minimal"`, the lowest level that
-model accepts. If the model still reports thinking tokens, a warning is logged
-once. Use `--thinking` to restore the model's default thinking behaviour.
+warning and falls back to `thinking_level="minimal"`. Setting
+`GEMINI_THINKING_OFF_MODE=minimal` requests `thinking_level="minimal"` directly.
+Use `--thinking` to restore the model's default thinking behaviour.
+Some models cannot turn thinking off completely. `gemini-3.8-flash` on Vertex
+accepts `thinking_budget=0` but still thinks: in local tests it used about
+900–1200 thinking tokens per answer on average, and rejects `minimal` with
+`400 Thinking level is unsupported`. Thinking tokens are billed as output.
+The token usage of every answer is logged (`Usage doc N: prompt=… output=…
+thoughts=…`), with a total at the end of the run.
+
+Even with greedy decoding the answers of these models are not fully
+deterministic: in repeated `--limit 5` runs the same question got different
+numerical answers (212 vs 205) and different numbers of thinking tokens.
+
+#### VSI-Bench result files
+
+Each run writes two JSON files in `--output_path/<task>/<date>_<model>.../`:
+
+- `<task>.json` holds one entry per question. Its `doc` contains the question
+  (`id`, `dataset`, `scene_name`, `question_type`, `question`, `options`), the
+  `ground_truth`, the raw model answer (`prediction`), the value actually
+  compared with the ground truth (`parsed_prediction`; `null` when a numerical
+  answer cannot be read as a number, which scores 0), and the per-question
+  metric (`MRA:.5:.95:.05` for numerical questions, `accuracy` for
+  multiple-choice ones). For API models, `response_meta` holds the API status
+  (`ok`, `api_error` or `upload_error`: no answer because of the API, scored as
+  wrong), the number of attempts, the last error, the token counts
+  (`prompt_tokens`, `output_tokens`, `thoughts_tokens`), the `finish_reason`
+  and the thinking mode.
+- `results.json` holds the official VSI-Bench scores: one value per question
+  type and `overall`, the mean of the question types, together with the
+  `tabulated_keys` and `tabulated_results` row. These values are computed
+  exactly as in the official code. The extra key `details` adds:
+  - `n_samples` and `n_per_question_type`;
+  - `object_rel_direction_subtypes_accuracy`: the easy, medium and hard
+    accuracies, whose mean is the official `object_rel_direction_accuracy`;
+  - `mca_mean_accuracy` and `na_mean_MRA`: the means over the multiple-choice
+    and the numerical question types;
+  - `per_dataset`: the same scores for arkitscenes, scannet and scannetpp;
+  - `n_unparsable_numerical_answers`;
+  - `api`: the status counts, the questions with no answer because of the API,
+    the answers taken from the resume cache, the thinking modes and the token
+    totals.
+
+The MRA is computed as in the official code, so the scores are comparable with
+the published ones. That code compares the relative error with thresholds from
+`np.linspace`, and floating-point rounding makes a few thresholds slightly
+smaller than their decimal value: `1 - 0.8` gives `0.19999999999999996`. An
+answer whose relative error is exactly 20% or 45% therefore scores 0.1 less
+than with exact thresholds (for example ground truth 5 and answer 4 or 6 scores
+0.6 instead of 0.7). This is kept on purpose.
 
 Gemini context caching is disabled by default. Enable it explicitly when the
 selected model and account support it:

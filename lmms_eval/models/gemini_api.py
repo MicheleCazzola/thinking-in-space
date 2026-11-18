@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import threading
 import time
 from typing import List, Tuple
 
@@ -14,6 +15,7 @@ from tqdm import tqdm
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+from lmms_eval.api import response_metadata
 
 import hashlib
 
@@ -38,6 +40,10 @@ except Exception as e:
 
 class _TransientUploadError(RuntimeError):
     """Upload-side condition worth retrying (e.g. file stuck in PROCESSING)."""
+
+
+class _CallTimeoutError(TimeoutError):
+    """A single API call exceeded its total wall-clock deadline (retryable)."""
 
 
 @register_model("gemini_api")
@@ -66,6 +72,11 @@ class GeminiAPI(lmms):
         thinking: bool = False,
         max_output_tokens: int = 8192,
         timeout: int = int(os.getenv("GEMINI_REQUEST_TIMEOUT", "300")),  # seconds per HTTP request
+        # Total wall-clock deadline (seconds) for ONE API call (generate / upload / poll).
+        # The httpx timeout above only bounds each connect/read phase, so a server that
+        # trickles bytes can keep a call alive far longer. Env GEMINI_CALL_DEADLINE;
+        # defaults to `timeout`; 0 disables.
+        call_deadline: float = None,
         backend: str = os.getenv("GEMINI_BACKEND", "api"),  # "api" (Gemini API key) or "vertex" (Vertex AI / ADC)
         gcp_project: str = None,
         gcp_location: str = None,
@@ -117,14 +128,25 @@ class GeminiAPI(lmms):
             raise ValueError(f"Unknown Gemini backend: {backend} (expected 'api' or 'vertex')")
         self.model_version = model_version
         self.timeout = timeout
+        if call_deadline is None:
+            call_deadline = os.getenv("GEMINI_CALL_DEADLINE")
+        self.call_deadline = float(timeout) if call_deadline in (None, "") else float(call_deadline)
+        if self.call_deadline <= 0:
+            self.call_deadline = None
+        self._abandoned_calls = 0
         self.context_cache_enabled = context_cache
         self.thinking_enabled = bool(thinking)
         self.max_output_tokens = int(max_output_tokens)
-        # When thinking is disabled we first request thinking_budget=0 (the hard
-        # "off" switch). Models that refuse a zero budget fall back to the lowest
-        # level they accept ("minimal"); see _thinking_fallback.
-        self.thinking_mode = None if self.thinking_enabled else "budget0"
+        # When thinking is disabled we request thinking_budget=0 by default (the hard
+        # "off" switch); GEMINI_THINKING_OFF_MODE=minimal requests thinking_level=minimal
+        # instead. Models that refuse a zero budget fall back to "minimal"; see _thinking_fallback.
+        thinking_off_mode = os.getenv("GEMINI_THINKING_OFF_MODE", "budget0").strip().lower()
+        if thinking_off_mode not in {"budget0", "minimal"}:
+            raise ValueError(f"GEMINI_THINKING_OFF_MODE must be 'budget0' or 'minimal', got {thinking_off_mode!r}")
+        self.thinking_mode = None if self.thinking_enabled else thinking_off_mode
         self._thinking_warning_emitted = False
+        # Token usage over the run (only for responses actually received).
+        self._usage_totals = {"responses": 0, "prompt": 0, "output": 0, "thoughts": 0, "with_thoughts": 0}
         if resolution_mode is not None:
             resolution_mode = resolution_mode.lower().replace("-", "_")
             valid_resolution_modes = {"low", "medium", "high", "ultra_high"}
@@ -162,6 +184,12 @@ class GeminiAPI(lmms):
             if not os.path.exists(self.response_persistent_folder):
                 os.makedirs(self.response_persistent_folder)
             self.response_persistent_file = os.path.join(self.response_persistent_folder, f"{self.model_version}_response.json")
+            # Per-sample API status / token usage, so resumed answers keep their metadata.
+            self.metadata_persistent_file = os.path.join(self.response_persistent_folder, f"{self.model_version}_metadata.json")
+            self.metadata_cache = {}
+            if os.path.exists(self.metadata_persistent_file):
+                with open(self.metadata_persistent_file, "r") as f:
+                    self.metadata_cache = json.load(f)
             if os.path.exists(self.response_persistent_file):
                 with open(self.response_persistent_file, "r") as f:
                     self.response_cache = json.load(f)
@@ -225,19 +253,38 @@ class GeminiAPI(lmms):
     def _check_response(self, response, doc_id):
         usage = getattr(response, "usage_metadata", None)
         thoughts = getattr(usage, "thoughts_token_count", None) or 0
+        prompt_tokens = getattr(usage, "prompt_token_count", None) or 0
+        output_tokens = getattr(usage, "candidates_token_count", None) or 0
+        totals = self._usage_totals
+        totals["responses"] += 1
+        totals["prompt"] += prompt_tokens
+        totals["output"] += output_tokens
+        totals["thoughts"] += thoughts
+        totals["with_thoughts"] += 1 if thoughts else 0
+        eval_logger.info(
+            f"Usage doc {doc_id}: prompt={prompt_tokens} output={output_tokens} thoughts={thoughts} "
+            f"(thinking mode '{self.thinking_mode}')"
+        )
         if thoughts and not self.thinking_enabled and not self._thinking_warning_emitted:
             eval_logger.warning(
                 f"Thinking is disabled but {self.model_version} used {thoughts} thinking tokens "
                 f"(doc {doc_id}, thinking mode '{self.thinking_mode}'). This model may not allow thinking to be fully disabled."
             )
             self._thinking_warning_emitted = True
+        candidates = getattr(response, "candidates", None) or []
+        finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        finish_reason = getattr(finish_reason, "name", finish_reason)
         if not response.text:
-            candidates = getattr(response, "candidates", None) or []
-            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
             eval_logger.warning(
                 f"Empty Gemini response for doc {doc_id}: finish_reason={finish_reason}, "
                 f"thoughts_tokens={thoughts}, prompt_feedback={getattr(response, 'prompt_feedback', None)}"
             )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "thoughts_tokens": thoughts,
+            "finish_reason": None if finish_reason is None else str(finish_reason),
+        }
 
     def flatten(self, input):
         new_list = []
@@ -261,6 +308,39 @@ class GeminiAPI(lmms):
     def _retry_delay(self, failed_attempts):
         """Exponential backoff: base, 2*base, 4*base, ... capped at retry_max_seconds."""
         return min(self.retry_max_seconds, self.retry_base_seconds * (2 ** (failed_attempts - 1)))
+
+    def _with_deadline(self, fn, description):
+        """Run fn() with a total wall-clock deadline.
+
+        The call runs in a daemon thread; if it does not finish within call_deadline seconds
+        it is abandoned (Python cannot kill a thread, its late result is discarded) and a
+        retryable _CallTimeoutError is raised. Note: an abandoned request may still be billed
+        if the server processed it.
+        """
+        if not self.call_deadline:
+            return fn()
+        outcome = {}
+        done = threading.Event()
+
+        def target():
+            try:
+                outcome["result"] = fn()
+            except BaseException as exc:  # re-raised in the caller's thread
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=target, name=f"gemini-call-{description[:40]}", daemon=True)
+        worker.start()
+        if not done.wait(self.call_deadline):
+            self._abandoned_calls += 1
+            raise _CallTimeoutError(
+                f"{description} exceeded the total deadline of {self.call_deadline:g}s and was abandoned "
+                f"({self._abandoned_calls} abandoned call(s) so far)"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
 
     def _call_with_retries(self, fn, description):
         """Run fn(), retrying transient errors (429/5xx, timeouts, dropped connections)."""
@@ -287,26 +367,38 @@ class GeminiAPI(lmms):
         if path in self._uploaded_files:
             return self._uploaded_files[path]
         if self.backend == "vertex":
-            media = self._call_with_retries(lambda: self._stage_in_gcs(path), f"GCS upload of {path}")
-        else:
+            description = f"GCS upload of {path}"
             media = self._call_with_retries(
-                lambda: self.wait_for_file_active(self.client.files.upload(file=path)),
-                f"Gemini upload of {path}",
+                lambda: self._with_deadline(lambda: self._stage_in_gcs(path), description), description
+            )
+        else:
+            description = f"Gemini upload of {path}"
+            media = self._call_with_retries(
+                lambda: self.wait_for_file_active(
+                    self._with_deadline(lambda: self.client.files.upload(file=path), description)
+                ),
+                description,
             )
         self._uploaded_files[path] = media
         return media
 
     def _stage_in_gcs(self, path):
-        """Upload a local file to GCS once (skipped if an object with the same size exists) and
-        return a Part referencing it. Gemini reads the whole video, as with the Files API."""
+        """Return a Part referencing gs://<bucket>/<prefix>/<dataset>/<scene>.mp4, uploading the
+        local file only if that object does not exist yet. Existing objects are never overwritten
+        (the prefix may point at a dataset copy already in the bucket); GCS uploads are atomic, so
+        an existing object is always complete. Gemini reads the whole video, as with the Files API."""
         parts = os.path.normpath(path).split(os.sep)
         blob_name = "/".join([self.gcs_prefix] + parts[-2:]) if self.gcs_prefix else "/".join(parts[-2:])
-        blob = self.gcs_bucket.blob(blob_name)
-        local_size = os.path.getsize(path)
-        if blob.exists():
-            blob.reload()
-        if not blob.size or int(blob.size) != local_size:
-            blob.upload_from_filename(path, timeout=self.timeout)
+        blob = self.gcs_bucket.get_blob(blob_name)  # None if missing; loads size if present
+        if blob is None:
+            self.gcs_bucket.blob(blob_name).upload_from_filename(
+                path, timeout=self.timeout, if_generation_match=0  # fail instead of overwriting
+            )
+        elif blob.size is not None and int(blob.size) != os.path.getsize(path):
+            eval_logger.warning(
+                f"gs://{self.gcs_bucket_name}/{blob_name} ({blob.size} B) differs in size from the local "
+                f"{path} ({os.path.getsize(path)} B); using the bucket copy, not overwriting it."
+            )
         mime_type = mimetypes.guess_type(path)[0] or "video/mp4"
         return types.Part.from_uri(file_uri=f"gs://{self.gcs_bucket_name}/{blob_name}", mime_type=mime_type)
 
@@ -324,7 +416,9 @@ class GeminiAPI(lmms):
         deadline = time.monotonic() + self.file_processing_timeout
         while True:
             try:
-                current_file = self.client.files.get(name=file_name)
+                current_file = self._with_deadline(
+                    lambda: self.client.files.get(name=file_name), f"Polling {file_name}"
+                )
             except Exception as exc:
                 # A transient error while polling must not discard a successful upload.
                 if not self._is_retryable_error(exc) or time.monotonic() >= deadline:
@@ -354,13 +448,16 @@ class GeminiAPI(lmms):
         if video_path in self._cached_contents:
             return self._cached_contents[video_path]
         try:
-            cached_content = self.client.caches.create(
-                model=self.model_version,
-                config=types.CreateCachedContentConfig(
-                    display_name=f"vsibench-{hashlib.sha256(video_path.encode()).hexdigest()[:16]}",
-                    contents=[uploaded_video],
-                    ttl="3600s",
+            cached_content = self._with_deadline(
+                lambda: self.client.caches.create(
+                    model=self.model_version,
+                    config=types.CreateCachedContentConfig(
+                        display_name=f"vsibench-{hashlib.sha256(video_path.encode()).hexdigest()[:16]}",
+                        contents=[uploaded_video],
+                        ttl="3600s",
+                    ),
                 ),
+                f"Context cache creation for {video_path}",
             )
             self._cached_contents[video_path] = cached_content.name
             eval_logger.info(f"Created Gemini context cache for {video_path}")
@@ -395,17 +492,27 @@ class GeminiAPI(lmms):
         def get_uuid(task, split, doc_id):
             return f"{task}___{split}___{doc_id}"
 
+        def record_metadata(doc, doc_uuid, **meta):
+            # Keyed by the dataset's own question id (falls back to the lmms-eval doc index).
+            meta = {"thinking_mode": self.thinking_mode, **meta}
+            response_metadata.record(doc.get("id", doc_uuid) if isinstance(doc, dict) else doc_uuid, meta)
+            if self.continual_mode is True:
+                self.metadata_cache[doc_uuid] = meta
+
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
+            doc = self.task_dict[task][split][doc_id]
+            doc_uuid = get_uuid(task, split, doc_id)
             if self.continual_mode is True and self.cache_mode == "resume":
-                doc_uuid = get_uuid(task, split, doc_id)
                 if doc_uuid in self.response_cache:
                     content = self.response_cache[doc_uuid]
                     if content:
+                        saved = self.metadata_cache.get(doc_uuid) or {"status": "ok"}
+                        record_metadata(doc, doc_uuid, **{**saved, "from_resume_cache": True})
                         res.append(content)
                         pbar.update(1)
                         continue
 
-            visual_paths = doc_to_visual(self.task_dict[task][split][doc_id])
+            visual_paths = doc_to_visual(doc)
             visuals = [visual_paths]
             request_contents = [contexts]
             cached_content_name = None
@@ -416,6 +523,8 @@ class GeminiAPI(lmms):
                 except RuntimeError as exc:
                     eval_logger.error(f"Skipping request for {doc_id}: {exc}")
                     self._failed_docs.append((doc_id, "video upload"))
+                    record_metadata(doc, doc_uuid, status="upload_error", attempts=0,
+                                    last_error=self._sanitize_error(exc)[:500])
                     res.append("")
                     pbar.update(1)
                     continue
@@ -429,6 +538,8 @@ class GeminiAPI(lmms):
             content = ""
             succeeded = False
             attempt = 0
+            usage = {}
+            last_error = None
             while attempt < self.max_attempts:
                 request_config = (
                     self._build_generation_config(cached_content_name)
@@ -436,17 +547,21 @@ class GeminiAPI(lmms):
                     else self.generation_config
                 )
                 try:
-                    response = self.client.models.generate_content(
-                        model=self.model_version,
-                        contents=request_contents,
-                        config=request_config,
+                    response = self._with_deadline(
+                        lambda: self.client.models.generate_content(
+                            model=self.model_version,
+                            contents=request_contents,
+                            config=request_config,
+                        ),
+                        f"Gemini generate_content for doc {doc_id}",
                     )
-                    self._check_response(response, doc_id)
+                    usage = self._check_response(response, doc_id)
                     content = response.text or ""
                     succeeded = True
                     break
                 except Exception as e:
                     error_message = self._sanitize_error(e)
+                    last_error = error_message[:500]
                     eval_logger.info(
                         f"Attempt {attempt + 1}/{self.max_attempts} failed with error: "
                         f"{error_message}"
@@ -475,16 +590,40 @@ class GeminiAPI(lmms):
                         )
             if not succeeded:
                 self._failed_docs.append((doc_id, "generation"))
+            # status: "ok" = the model answered (possibly with an empty/unparsable text);
+            # "api_error" = no answer because of API errors (scored as wrong).
+            record_metadata(
+                doc,
+                doc_uuid,
+                status="ok" if succeeded else "api_error",
+                attempts=attempt + 1 if succeeded else attempt,
+                last_error=None if succeeded else last_error,
+                **usage,
+            )
             res.append(content)
             pbar.update(1)
 
             if self.continual_mode is True:  # Cache the response
-                doc_uuid = get_uuid(task, split, doc_id)
                 self.response_cache[doc_uuid] = content
                 with open(self.response_persistent_file, "w") as f:
                     json.dump(self.response_cache, f)
+                with open(self.metadata_persistent_file, "w") as f:
+                    json.dump(self.metadata_cache, f)
 
         pbar.close()
+        t = self._usage_totals
+        if t["responses"]:
+            eval_logger.info(
+                f"Token usage over {t['responses']} response(s) (thinking mode '{self.thinking_mode}'): "
+                f"prompt={t['prompt']} output={t['output']} thoughts={t['thoughts']} "
+                f"(mean thoughts/response={t['thoughts'] / t['responses']:.1f}; "
+                f"{t['with_thoughts']}/{t['responses']} responses used thinking)"
+            )
+        if self._abandoned_calls:
+            eval_logger.warning(
+                f"{self._abandoned_calls} API call(s) exceeded the {self.call_deadline:g}s deadline and were "
+                "abandoned (and retried). Abandoned requests may still have been billed."
+            )
         if self._failed_docs:
             eval_logger.error(
                 f"{len(self._failed_docs)}/{len(requests)} requests got NO model answer because of API errors "

@@ -25,6 +25,8 @@ Options:
   --gcp_project ID       Vertex: Google Cloud project (default: $GOOGLE_CLOUD_PROJECT)
   --gcp_location NAME    Vertex: location (default: $GOOGLE_CLOUD_LOCATION or global)
   --gcs_bucket NAME      Vertex: GCS bucket used to stage the videos (default: $VSI_BENCH_GCS_BUCKET)
+  --gcs_prefix PATH      Vertex: folder in the bucket holding <dataset>/<scene>.mp4; existing
+                         videos are reused, missing ones uploaded (default: $VSI_BENCH_GCS_PREFIX or vsibench)
   --resume_dir PATH      Gemini: persist answers in PATH; re-running only redoes failed questions
   --help                 Show this help
 
@@ -65,6 +67,7 @@ backend="api"
 gcp_project="${GOOGLE_CLOUD_PROJECT:-}"
 gcp_location="${GOOGLE_CLOUD_LOCATION:-global}"
 gcs_bucket="${VSI_BENCH_GCS_BUCKET:-}"
+gcs_prefix="${VSI_BENCH_GCS_PREFIX:-vsibench}"
 resume_dir=""
 
 while [[ $# -gt 0 ]]; do
@@ -149,6 +152,12 @@ while [[ $# -gt 0 ]]; do
         [[ $# -ge 2 ]] || { echo "Missing value for --gcs_bucket" >&2; exit 2; }
         gcs_bucket="${2#gs://}"
         gcs_bucket="${gcs_bucket%/}"
+        shift 2
+        ;;
+    --gcs_prefix)
+        [[ $# -ge 2 ]] || { echo "Missing value for --gcs_prefix" >&2; exit 2; }
+        gcs_prefix="${2#/}"
+        gcs_prefix="${gcs_prefix%/}"
         shift 2
         ;;
     --resume_dir)
@@ -275,7 +284,7 @@ case "$backend" in
         ;;
 esac
 
-for value in "$gcp_project" "$gcp_location" "$gcs_bucket" "$resume_dir"; do
+for value in "$gcp_project" "$gcp_location" "$gcs_bucket" "$gcs_prefix" "$resume_dir"; do
     if [[ "$value" == *,* || "$value" == *=* ]]; then
         echo "Values passed to Gemini may not contain ',' or '=': $value" >&2
         exit 2
@@ -285,7 +294,7 @@ done
 if [[ "$model_family" == "gemini_api" && "$backend" == "vertex" ]]; then
     [[ -n "$gcp_project" ]] || { echo "Vertex backend: set --gcp_project or GOOGLE_CLOUD_PROJECT" >&2; exit 2; }
     [[ -n "$gcs_bucket" ]] || { echo "Vertex backend: set --gcs_bucket or VSI_BENCH_GCS_BUCKET" >&2; exit 2; }
-    model_args+=",gcp_project=${gcp_project},gcp_location=${gcp_location},gcs_bucket=${gcs_bucket}"
+    model_args+=",gcp_project=${gcp_project},gcp_location=${gcp_location},gcs_bucket=${gcs_bucket},gcs_prefix=${gcs_prefix}"
     # Vertex uses Application Default Credentials (the VM service account), not an API key.
     unset GOOGLE_API_KEY
 elif [[ "$model_family" == "gemini_api" ]]; then
