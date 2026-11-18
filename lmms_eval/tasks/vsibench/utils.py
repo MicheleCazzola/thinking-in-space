@@ -207,6 +207,10 @@ def _details(df):
     na = [v for t, v in per_type.items() if t in NA_QUESTION_TYPES]
     details["mca_mean_accuracy"] = sum(mca) / len(mca) if mca else None
     details["na_mean_MRA"] = sum(na) / len(na) if na else None
+    # ReVSI (arXiv 2604.24300, Table 3) reports VSI-Bench "Avg." over 7 tasks, without
+    # obj_appearance_order: the plain mean of the other question-type scores.
+    seven = [v for t, v in per_type.items() if t != "obj_appearance_order"]
+    details["overall_7_tasks_no_appearance_order"] = sum(seven) / len(seven) if seven else None
 
     # Same scores per source dataset (arkitscenes / scannet / scannetpp).
     per_dataset = OrderedDict()

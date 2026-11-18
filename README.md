@@ -187,21 +187,29 @@ as they arrive and re-running the same command only redoes the missing ones.
 The per-question metadata (see below) is saved next to them in
 `<model>_metadata.json`, so resumed answers keep it.
 
-Gemini thinking is disabled by default (`--no-thinking`): requests are sent with
-`thinking_budget=0`. If a model rejects a zero budget, the backend logs a
-warning and falls back to `thinking_level="minimal"`. Setting
-`GEMINI_THINKING_OFF_MODE=minimal` requests `thinking_level="minimal"` directly.
-Use `--thinking` to restore the model's default thinking behaviour.
-Some models cannot turn thinking off completely. `gemini-3.8-flash` on Vertex
-accepts `thinking_budget=0` but still thinks: in local tests it used about
-900–1200 thinking tokens per answer on average, and rejects `minimal` with
-`400 Thinking level is unsupported`. Thinking tokens are billed as output.
-The token usage of every answer is logged (`Usage doc N: prompt=… output=…
-thoughts=…`), with a total at the end of the run.
+With `--no-thinking` (the default) the backend requests the **lowest thinking
+setting the model accepts**, chosen by `GEMINI_THINKING_OFF_MODE`:
 
-Even with greedy decoding the answers of these models are not fully
-deterministic: in repeated `--limit 5` runs the same question got different
-numerical answers (212 vs 205) and different numbers of thinking tokens.
+- `auto` (default):
+  - **Gemini 3 and later:** `thinking_level="minimal"`. If the model rejects it
+    with a 400, the backend logs a warning and switches once to
+    `thinking_level="low"`. `thinking_budget` is deprecated on Gemini 3 and is
+    not sent.
+  - **Gemini 2.x:** `thinking_budget=0`, the documented off switch for those
+    models.
+- `budget0`, `minimal` or `low`: force that single setting, with no fallback.
+
+Use `--thinking` to restore the model's default thinking behaviour.
+
+Gemini 3 models cannot turn thinking off completely. `gemini-3.8-flash`
+supports only `LOW`, `MEDIUM` (its default) and `HIGH`, so `auto` ends up at
+`LOW`. Its documentation also says that `temperature`, `top_p` and `top_k` are
+ignored by the backend, so greedy decoding cannot be enforced and answers are
+not fully deterministic. In repeated runs the same question got 212 and 205.
+
+Thinking tokens are billed as output. The token usage of every answer is
+logged (`Usage doc N: prompt=… output=… thoughts=…`), with a total at the end of
+the run.
 
 #### VSI-Bench result files
 
@@ -227,6 +235,9 @@ Each run writes two JSON files in `--output_path/<task>/<date>_<model>.../`:
     accuracies, whose mean is the official `object_rel_direction_accuracy`;
   - `mca_mean_accuracy` and `na_mean_MRA`: the means over the multiple-choice
     and the numerical question types;
+  - `overall_7_tasks_no_appearance_order`: the mean over 7 question types,
+    without `obj_appearance_order`. This is the "Avg." that ReVSI
+    (arXiv 2604.24300, Table 3) reports for VSI-Bench;
   - `per_dataset`: the same scores for arkitscenes, scannet and scannetpp;
   - `n_unparsable_numerical_answers`;
   - `api`: the status counts, the questions with no answer because of the API,

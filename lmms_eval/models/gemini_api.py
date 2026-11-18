@@ -137,13 +137,25 @@ class GeminiAPI(lmms):
         self.context_cache_enabled = context_cache
         self.thinking_enabled = bool(thinking)
         self.max_output_tokens = int(max_output_tokens)
-        # When thinking is disabled we request thinking_budget=0 by default (the hard
-        # "off" switch); GEMINI_THINKING_OFF_MODE=minimal requests thinking_level=minimal
-        # instead. Models that refuse a zero budget fall back to "minimal"; see _thinking_fallback.
-        thinking_off_mode = os.getenv("GEMINI_THINKING_OFF_MODE", "budget0").strip().lower()
-        if thinking_off_mode not in {"budget0", "minimal"}:
-            raise ValueError(f"GEMINI_THINKING_OFF_MODE must be 'budget0' or 'minimal', got {thinking_off_mode!r}")
-        self.thinking_mode = None if self.thinking_enabled else thinking_off_mode
+        # When thinking is disabled we request the LOWEST thinking the model accepts.
+        # GEMINI_THINKING_OFF_MODE:
+        #   auto (default) - Gemini 3+: thinking_level MINIMAL, falling back to LOW if the model
+        #                    rejects it (e.g. gemini-3.8-flash supports only LOW/MEDIUM/HIGH).
+        #                    thinking_budget is deprecated on Gemini 3+ and not sent.
+        #                    Gemini 2.x: thinking_budget=0 (the documented off switch).
+        #   budget0 | minimal | low - force that single setting (no fallback).
+        # See _thinking_fallback.
+        thinking_off_mode = os.getenv("GEMINI_THINKING_OFF_MODE", "auto").strip().lower()
+        if thinking_off_mode not in {"auto", "budget0", "minimal", "low"}:
+            raise ValueError(
+                f"GEMINI_THINKING_OFF_MODE must be 'auto', 'budget0', 'minimal' or 'low', got {thinking_off_mode!r}"
+            )
+        if thinking_off_mode == "auto":
+            major = self._gemini_major_version(model_version)
+            self._thinking_chain = ["minimal", "low"] if major is not None and major >= 3 else ["budget0"]
+        else:
+            self._thinking_chain = [thinking_off_mode]
+        self.thinking_mode = None if self.thinking_enabled else self._thinking_chain[0]
         self._thinking_warning_emitted = False
         # Token usage over the run (only for responses actually received).
         self._usage_totals = {"responses": 0, "prompt": 0, "output": 0, "thoughts": 0, "with_thoughts": 0}
@@ -227,26 +239,36 @@ class GeminiAPI(lmms):
         }
         if self.thinking_mode == "budget0":
             config["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        elif self.thinking_mode == "minimal":
-            config["thinking_config"] = types.ThinkingConfig(thinking_level="minimal")
+        elif self.thinking_mode in ("minimal", "low"):
+            config["thinking_config"] = types.ThinkingConfig(thinking_level=self.thinking_mode)
         if self.media_resolution is not None:
             config["media_resolution"] = self.media_resolution
         if cached_content is not None:
             config["cached_content"] = cached_content
         return types.GenerateContentConfig(**config)
         
+    @staticmethod
+    def _gemini_major_version(model_version):
+        match = re.search(r"gemini-(\d+)", str(model_version).lower())
+        return int(match.group(1)) if match else None
+
     def _thinking_fallback(self, error):
-        """Switch from thinking_budget=0 to thinking_level=minimal if the model rejects a zero budget."""
-        if self.thinking_mode != "budget0":
+        """If the model rejects the current thinking setting (400 mentioning thinking), move once
+        to the next, higher setting of the chain (auto mode on Gemini 3+: minimal -> low)."""
+        if self.thinking_mode not in self._thinking_chain:
+            return False
+        position = self._thinking_chain.index(self.thinking_mode)
+        if position + 1 >= len(self._thinking_chain):
             return False
         message = str(error).lower()
         if "400" not in message or "think" not in message:
             return False
+        next_mode = self._thinking_chain[position + 1]
         eval_logger.warning(
-            f"{self.model_version} rejected thinking_budget=0 ({self._sanitize_error(error)}). "
-            "Falling back to thinking_level='minimal', the lowest thinking level the model accepts."
+            f"{self.model_version} rejected thinking mode '{self.thinking_mode}' ({self._sanitize_error(error)}). "
+            f"Falling back to '{next_mode}', the next lowest thinking setting."
         )
-        self.thinking_mode = "minimal"
+        self.thinking_mode = next_mode
         self.generation_config = self._build_generation_config()
         return True
 
@@ -267,8 +289,9 @@ class GeminiAPI(lmms):
         )
         if thoughts and not self.thinking_enabled and not self._thinking_warning_emitted:
             eval_logger.warning(
-                f"Thinking is disabled but {self.model_version} used {thoughts} thinking tokens "
-                f"(doc {doc_id}, thinking mode '{self.thinking_mode}'). This model may not allow thinking to be fully disabled."
+                f"Thinking was requested at its lowest setting ('{self.thinking_mode}') but {self.model_version} "
+                f"still used {thoughts} thinking tokens (doc {doc_id}). This model does not allow thinking to be "
+                "fully disabled; thinking tokens are billed as output."
             )
             self._thinking_warning_emitted = True
         candidates = getattr(response, "candidates", None) or []

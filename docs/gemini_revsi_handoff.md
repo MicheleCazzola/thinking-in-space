@@ -1,6 +1,6 @@
 # Handoff: Gemini Flash evaluation on VSI-Bench-tiny (ReVSI protocol)
 
-Status as of 2026-11-18, about 01:00 CET.
+Status as of 2026-11-18, about 01:45 CET.
 
 - Branch: `adapt-vsibench`, pushed to `origin`, which is the user's fork
   (`MicheleCazzola/thinking-in-space`).
@@ -20,11 +20,27 @@ Status as of 2026-11-18, about 01:00 CET.
 
 ## 1. Goal
 
-Run online inference with **Gemini 3.8 Flash** on **VSI-Bench tiny** using the
-**same evaluation setup as the ReVSI paper** (arXiv 2604.24300). Thinking is
-**requested off**; §3.1 explains why it cannot be fully disabled. The final run
-happens on a **Google Cloud VM**, billed to the Google Cloud free-trial credits
-through **Vertex AI**.
+Evaluate **Gemini 3.8 Flash** on the **same data and protocol that the ReVSI
+paper (arXiv 2604.24300) used for Gemini 3 Flash**, and compare with their
+numbers.
+
+- **Phase 1 (current):** VSI-Bench tiny.
+- **Phase 2 (later):** the ReVSI benchmark itself. For proprietary models ReVSI
+  uses a tiny subset of 1,093 ReVSI samples.
+
+Thinking is set **explicitly to the lowest level the model accepts**, which is
+`LOW` on 3.8 Flash (§3.1). The run is billed to the Google Cloud free-trial
+credits through **Vertex AI**. It can run from the laptop or from a VM.
+
+Reference numbers: ReVSI Table 3, VSI-Bench tiny, Gemini 3 Flash at 1 FPS.
+
+| Obj. Cnt | Abs. Dist | Obj. Size | Room Size | Rel. Dist | Rel. Dir | Route Plan | Avg. |
+|---|---|---|---|---|---|---|---|
+| 45.6 | 36.3 | 74.9 | 47.4 | 54.3 | 52.4 | 50.0 | 55.9 |
+
+Their Avg. is the mean of these **7 tasks, without `obj_appearance_order`**.
+Compare it with `details.overall_7_tasks_no_appearance_order`, not with the
+official 8-task `overall`.
 
 Standing rules from the user:
 - Keep **both Gemini backends**: Google AI Studio (API key) and Vertex AI. Both
@@ -58,16 +74,45 @@ Source: the ReVSI appendix ("For proprietary models…") and Table 8.
 | Media resolution: not specified, so the default is assumed | do **not** pass `--resolution_mode` |
 
 Known deviations and open choices:
-- **392 questions, not 400.** 8 of the official tiny ids were removed from the
-  current HF dataset release. The paper does not say which dataset revision it
-  used.
+- **392 questions, not 400.** The official tiny ids (400, published by the
+  VSI-Bench authors in
+  https://github.com/vision-x-nyu/thinking-in-space/issues/9 as `subset_indexes`
+  in `lmms_eval/tasks/vsibench/utils.py` at commit `9d2ab30`) match
+  `vsibench_tiny_ids.txt` exactly.
+  - 8 of them (2559, 2771, 3329, 3348, 4689, 4707, 4818, 5146) were **never
+    public**. They are missing already from the first HF release (revision
+    `a9fde418ea`, 2024-12-19: 5,130 rows, ids 0–5155 with 26 gaps) and from
+    every later revision.
+  - In the same issue an author explains the gap: an "additional round of data
+    filtering" removed them, and "the subset only remains 392 questions".
+  - So ReVSI, which uses "the official tiny set for VSI-Bench" (Appendix D),
+    almost certainly evaluated on the same 392 questions. This is not stated
+    explicitly.
+  - From their neighbouring ids (same scene and type), the 8 were probably 1
+    counting, 1 appearance order, 2 object size, 3 absolute distance and 1
+    route planning question. This is an inference.
+  - The tiny set has 49 `obj_appearance_order` questions. ReVSI excludes that
+    task from its tables (Section 4.2: "it primarily assesses temporal
+    reasoning rather than 3D spatial intelligence").
 - **Numerical post-prompt wording.** The official code says "Do not response
   anything other than a single number!" (with the typo). The ReVSI Table 8
   prints "Do not respond with anything other than a single number!". The repo
   **keeps the official code string**. Changing it is a one-line yaml edit; the
   user has not decided.
-- **Thinking.** The user chose to turn it off; the paper does not specify it.
-  It cannot be fully disabled on this model (§3.1).
+- **What ReVSI does not state for Gemini 3:** the model ID, the API, the
+  thinking setting, temperature/top_p/top_k, max output tokens, the number of
+  runs, the media resolution, and how answers are parsed and failed answers
+  handled. No Gemini evaluation code is published
+  (https://github.com/3dlg-hcvc/revsi). The paper says "greedy decoding", but
+  only for the zero-shot models in general.
+- **Thinking.** ReVSI does not specify it, so they probably used the API
+  default (`MEDIUM` on 3.8 Flash). The user chose the lowest level, `LOW`,
+  to reduce thinking and cost. This is a declared deviation.
+- **Decoding.** The 3.8 Flash docs say `temperature`, `top_p` and `top_k`
+  "are ignored by the backend". Greedy decoding cannot be enforced, and
+  answers are not deterministic (§3.2).
+- **Model.** 3.8 Flash replaces Gemini 3 Flash; comparing them is the point
+  of the study.
 - `max_output_tokens=8192`, the same as the original lmms-eval Gemini code. The
   paper does not specify it.
 
@@ -82,9 +127,37 @@ Measured in local `--limit 5` runs on 2026-11-18, on the same 5 questions:
 | `thinking_budget=0` (`budget0`, the default) | accepted, 5/5 answers, but the model still thinks: mean 1209 thinking tokens per answer (range 287–2489) in one run, 937 in another; 4–5 of 5 answers used thinking |
 | `thinking_level=minimal` (`GEMINI_THINKING_OFF_MODE=minimal`) | rejected on every request: `400 INVALID_ARGUMENT 'Thinking level is unsupported: THINKING_LEVEL_MINIMAL'`, 0/5 answers |
 
-Decision: use `budget0`. Thinking tokens are billed as output (§6). This
-should be reported as a deviation: thinking was requested off, but the model
-still uses some.
+The official docs explain both results:
+- 3.8 Flash supports only `LOW`, `MEDIUM` (default) and `HIGH`, and `MINIMAL`
+  returns a validation error.
+- `thinking_budget` is deprecated on Gemini 3 and can cause intermittent
+  `400 INVALID_ARGUMENT` errors. With `budget0` the model therefore almost
+  certainly ran at its default, `MEDIUM`.
+
+Decision (2026-11-18): set an explicit `thinking_level` at the lowest level
+the model accepts. In `auto` mode the code tries `MINIMAL`, and on the 400
+switches once to `LOW` (§4.4). Thinking cannot be fully disabled on Gemini 3
+models.
+
+**`LOW` measured live** (`logs/local-test/think-low`, same 5 questions). The
+fallback worked: one rejected `MINIMAL` request, then `LOW` for every request,
+and 5/5 answers.
+
+| Question | budget0 run 1 | budget0 run 2 | LOW |
+|---|---|---|---|
+| 37 | 994 | 840 | 651 |
+| 42 | 2489 | 836 | 1843 |
+| 80 | 771 | 1076 | 1155 |
+| 166 | 1504 | 1935 | 2595 |
+| 182 | 287 | 0 | 277 |
+| **mean** | **1209** | **937** | **1304** |
+
+`LOW` does **not** reduce thinking on these questions: the difference is
+within run-to-run noise. Either `budget0` already ran at a low level rather
+than `MEDIUM`, or LOW and MEDIUM think about the same amount for one-number
+answers; this data cannot tell which. `LOW` is kept anyway: it is explicit,
+documented and avoids the deprecated parameter, at the same cost. Thinking
+cannot be reduced further with the available settings.
 
 ### 3.2 Results are not fully deterministic
 
@@ -170,8 +243,15 @@ hung for about 27 minutes before the server returned 504.
 
 ### 4.4 Thinking mode and token logging (uncommitted)
 
-- **`GEMINI_THINKING_OFF_MODE`** is `budget0` (default) or `minimal`. Any other
-  value is rejected.
+- **`GEMINI_THINKING_OFF_MODE`** can be `auto` (default), `budget0`, `minimal`
+  or `low`; any other value is rejected.
+  - `auto` on Gemini 3 and later: chain `minimal` → `low`. If the model rejects
+    the current level (a 400 mentioning thinking), the code moves once to the
+    next level and logs a warning. The rejected request does not count as an
+    attempt. `thinking_budget` is not sent.
+  - `auto` on Gemini 2.x: `budget0`.
+  - An explicit value forces that single setting, with no fallback.
+  - The major version is read from the model ID (`gemini-<N>`).
 - **One log line per question:**
   `Usage doc N: prompt=… output=… thoughts=… (thinking mode '…')`.
 - **End-of-run total:** prompt, output and thinking tokens, the mean thinking
@@ -200,6 +280,7 @@ hung for about 27 minutes before the server returned 504.
   - `n_samples` and `n_per_question_type`;
   - `object_rel_direction_subtypes_accuracy` (easy, medium, hard);
   - `mca_mean_accuracy` and `na_mean_MRA`;
+  - `overall_7_tasks_no_appearance_order`, which matches ReVSI's Avg.;
   - `per_dataset` (arkitscenes, scannet, scannetpp);
   - `n_unparsable_numerical_answers`;
   - `api`: status counts, no-answer count, resume count, thinking modes and
@@ -231,6 +312,7 @@ the session scratchpad, not in the repo.
 | Vertex, `--limit 5`, `budget0` (`logs/local-test/vertex-lim5`, run `1117_1818`) | 5/5, 51.25; video read from the bucket, nothing uploaded; ~26 s per question |
 | Vertex, `budget0` vs `minimal` (`logs/local-test/think-budget0`, `think-minimal`) | see §3.1 |
 | Vertex, `--limit 5` with all the new code (`logs/local-test/vertex-lim5`, run `1117_1848`) | 5/5, 46.25 (see §3.2); one `Server disconnected` error was retried and recovered (`attempts: 2`); `parsed_prediction`, `response_meta` and `details` present and correct |
+| Vertex, `--limit 5`, `auto` thinking (`logs/local-test/think-low`, run `1117_1921`) | 5/5, 46.25; `MINIMAL` rejected once, then `LOW` for every request; mean 1304 thinking tokens (§3.1); `details.api.thinking_modes = ['low']` |
 
 The `run.log` of a run is overwritten when another run uses the same
 `--output_path`. Use a new output path for the final run.
@@ -245,13 +327,14 @@ numerical. It is covered offline (§5.1).
   about 68 tokens per second. Without context caching every question re-sends
   its video: about **3.1M input tokens**. The live runs match this rate
   (47,098 prompt tokens for 5 questions).
-- **Output.** About 1,000 thinking tokens per answer (§3.1) gives about
-  **0.4M output tokens**. The answers themselves are negligible.
+- **Output.** About 900–1300 thinking tokens per answer were measured, with
+  `LOW` and with `budget0` alike (§3.1). That is about **0.4–0.5M output
+  tokens**; the answers themselves are negligible.
 
 | Period | Input $/1M | Output $/1M | Estimated total |
 |---|---|---|---|
-| Until 2026-12-31 | $0.75 | $3.75 | ≈ **$3.9** (2.3 input + 1.6 thinking) |
-| From 2027-01-01 | $1.50 | $7.50 | ≈ **$7.8** |
+| Until 2026-12-31 | $0.75 | $3.75 | ≈ **$3.9–4.2** (2.3 input + 1.6–1.9 thinking) |
+| From 2027-01-01 | $1.50 | $7.50 | ≈ **$7.8–8.4** |
 
 Other costs:
 - VM: e2-standard-2, about $0.07/h, and the run takes about 2.8 h
@@ -264,6 +347,7 @@ Costs show up in Billing → Credits / Reports with a delay of a few hours.
 
 ## 7. Next steps
 
+0. ~~Local `--limit 5` test with `auto` thinking~~: done, it passed (§5.2).
 1. **Commit and push** the uncommitted changes on `adapt-vsibench`, including
    the new `lmms_eval/api/response_metadata.py`. The user does this.
 2. **VM setup.**
